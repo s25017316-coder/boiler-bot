@@ -11,7 +11,60 @@ BOT_TOKEN = os.environ.get("TG_BOT_TOKEN", "9035492152:AAFExmRGivwbNcAgwTkTvEL1S
 RECIPIENTS = [7668006338, 9191128026]
 STATE_FILE = "bot_state.json"
 
+RATE_LIMIT_MAX_LEADS = 5
+RATE_LIMIT_WINDOW_SEC = 20 * 60  # 20 минут
+
 state_lock = threading.Lock()
+rate_lock = threading.Lock()
+
+# Хранилище в памяти: { ip: {"timestamps": [float, ...], "blocked_until": float} }
+ip_rate_store = {}
+
+
+def get_client_ip():
+    forwarded_for = request.headers.get("X-Forwarded-For", "")
+    if forwarded_for:
+        first_ip = forwarded_for.split(",")[0].strip()
+        if first_ip:
+            return first_ip
+    return (request.remote_addr or "unknown").strip()
+
+
+def check_and_record_ip_rate(ip, now):
+    with rate_lock:
+        # Периодическая очистка устаревших записей, чтобы не росла память
+        expired_ips = [
+            k for k, v in ip_rate_store.items()
+            if v["blocked_until"] <= now and all((now - ts) >= RATE_LIMIT_WINDOW_SEC for ts in v["timestamps"])
+        ]
+        for k in expired_ips:
+            del ip_rate_store[k]
+
+        entry = ip_rate_store.get(ip)
+        if not entry:
+            entry = {"timestamps": [], "blocked_until": 0.0}
+            ip_rate_store[ip] = entry
+
+        if entry["blocked_until"] > now:
+            retry_after = max(1, int(entry["blocked_until"] - now))
+            return False, retry_after
+
+        if entry["blocked_until"] != 0.0 and entry["blocked_until"] <= now:
+            entry["blocked_until"] = 0.0
+            entry["timestamps"] = []
+
+        entry["timestamps"] = [ts for ts in entry["timestamps"] if (now - ts) < RATE_LIMIT_WINDOW_SEC]
+
+        if len(entry["timestamps"]) >= RATE_LIMIT_MAX_LEADS:
+            entry["blocked_until"] = now + RATE_LIMIT_WINDOW_SEC
+            return False, RATE_LIMIT_WINDOW_SEC
+
+        entry["timestamps"].append(now)
+
+        if len(entry["timestamps"]) >= RATE_LIMIT_MAX_LEADS:
+            entry["blocked_until"] = now + RATE_LIMIT_WINDOW_SEC
+
+        return True, 0
 
 
 def load_state():
@@ -77,7 +130,7 @@ def handle_update(update, state):
     if text.startswith("/start"):
         send_to_chat(
             chat_id,
-            "Бот активен. Заявки с сайта remont-kotlov-almaty.kz будут приходить сюда.\n"
+            "Бот активен. Заявки с сайта remont-kotlov-almaty.com.kz будут приходить сюда.\n"
             "Команда аналитики: /stats"
         )
     elif text.startswith("/stats"):
@@ -129,6 +182,16 @@ def create_lead():
     if request.method == "OPTIONS":
         return "", 204
 
+    client_ip = get_client_ip()
+    allowed, retry_after = check_and_record_ip_rate(client_ip, time.time())
+    if not allowed:
+        minutes = max(1, (retry_after + 59) // 60)
+        return jsonify({
+            "ok": False,
+            "error": f"Превышен лимит заявок (максимум {RATE_LIMIT_MAX_LEADS} за 20 минут). Повторите через {minutes} мин.",
+            "retry_after_sec": retry_after
+        }), 429
+
     payload = request.get_json(silent=True) or {}
     name = (payload.get("name") or "").strip()
     phone = (payload.get("phone") or "").strip()
@@ -152,7 +215,8 @@ def create_lead():
         f"Телефон: {phone}\n"
         f"Локация: {location}\n"
         f"Котёл: {model}\n"
-        f"Источник: {source}"
+        f"Источник: {source}\n"
+        f"IP: {client_ip}"
     )
 
     for chat_id in RECIPIENTS:
